@@ -1,10 +1,8 @@
-import asyncio
+
 import io
 import os
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Optional
+import argparse
+from typing import Optional
 import json
 import requests
 from markitdown import MarkItDown
@@ -105,13 +103,54 @@ def scrape_website(url: str) -> tuple[Optional[str], Optional[str]]:
     Returns:
         tuple: A tuple of (content, error_message). Content is None if there's an error.
     """
-    content, error = scrape_by_jina(url)
-    if content is not None:
-        return content, None
-    # Fallback to requests scraping
-    content, error_requests = scrape_request(url)
-    if content is not None:
-        return content, None
-    # If both methods failed, return combined error messages
-    combined_error = f"Jina scraping error: {error}\nRequests scraping error: {error_requests}"
-    return None, combined_error
+    if not url:
+        return None, "[ERROR] URL is empty. Please provide a valid URL."
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    
+    if "huggingface.co/datasets" in url or "huggingface.co/spaces" in url:
+        return None, "[WARNING] You are trying to scrape a Hugging Face dataset for answers, please do not use the scrape tool for this purpose."
+    
+    retry_count = 0
+    max_retries = 3
+
+    while retry_count < max_retries:
+        try:
+            content, error = scrape_by_jina(url)
+            if content is not None:
+                return content, None
+            # Fallback to requests scraping
+            content, error_requests = scrape_request(url)
+            if content is not None:
+                return content, None
+            # If both methods failed, return combined error messages
+            combined_error = f"Jina scraping error: {error}\nRequests scraping error: {error_requests}"
+            return None, combined_error
+        except Exception as e:
+            retry_count += 1
+            if retry_count == max_retries:
+                return None, f"[Error] Failed to get content from Jina.ai: {str(e)}\n"
+    
+    return None, "[Error] Exceeded maximum retries to scrape the website."
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Scrape website content using Jina API with fallback to requests"
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        help="The URL of the website to scrape",
+    )
+    args = parser.parse_args()
+    url = args.url
+
+    content, error = scrape_website(url)
+    if error:
+        print(f"Error: {error}")
+    else:
+        print(f"Scraped Content:\n{content}")
+
+
+if __name__ == "__main__":
+    main()

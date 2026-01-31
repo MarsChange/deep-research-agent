@@ -268,7 +268,8 @@ async def agent_loop(
     while True:
         # Make the streaming request
         stream = await client.chat.completions.create(
-            messages=prompt_messages, **params
+            messages=prompt_messages, **params,
+            extra_body={"enable_thinking":True}
         )
 
         tool_calls_buffer = {}
