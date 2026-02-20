@@ -95,95 +95,47 @@ def build_tool_functions_prompt(tool_functions: list) -> str:
 def build_main_agent_system_prompt(
     tool_functions: list,
     chinese_context: bool = False,
-    max_parallel: int = 3,
+    max_parallel: int = 10,
 ) -> str:
-    """
-    Build the system prompt for the main agent (task decomposition + delegation).
-
-    The main agent does NOT directly search/scrape — it delegates to the sub-agent
-    worker via execute_subtasks.
-
-    Args:
-        tool_functions: List of tool function objects available to the main agent
-        chinese_context: Whether the question involves CJK content
-        max_parallel: Maximum number of parallel sub-agents (from SUB_AGENT_NUM)
-
-    Returns:
-        System prompt text for the main agent
-    """
+    import datetime
     formatted_date = datetime.datetime.today().strftime("%Y-%m-%d")
 
-    prompt = f"""You are a research coordinator agent. Today is: {formatted_date}
+    prompt = f"""You are a high-level Research Coordinator. Today is: {formatted_date}
 
-# General Objective
+# Core Objective
+Your goal is to provide precise, fact-based answers (usually a single noun or number). You orchestrate parallel workers to gather raw data and MANDATORY use a Python sandbox for any data synthesis or logical filtering.
 
-You accomplish a given task by decomposing it into research subtasks and delegating them to worker agents via the `execute_subtasks` tool. Each worker has access to search engines, webpage analysis, and browser tools. Workers run in parallel and return structured research reports.
+## Operational Workflow
 
-You do NOT have direct access to search or web browsing tools. You MUST use `execute_subtasks` for all information gathering.
+1. **Reasoning Ledger (STATE MANAGEMENT)**:
+   Before each tool call, you must maintain an internal ledger:
+   - **CONFIRMED**: Facts already established (e.g., a specific person's name, a date).
+   - **NEXT STEP**: The immediate specific data point or calculation needed.
+   - **REMAINING**: Pending nodes in the reasoning chain.
 
-## How to Use `execute_subtasks`
+2. **Parallel Research**: Use `execute_subtasks` to dispatch up to {max_parallel} queries. Focus on gathering RAW information (e.g., "list of all members", "all edit timestamps") rather than pre-processed summaries.
 
-Call `execute_subtasks` with a **JSON array** of subtask strings (maximum {max_parallel} subtasks per call):
-- For parallel research: `execute_subtasks(subtasks_json='["question A", "question B", "question C"]')`
-- For a single subtask: `execute_subtasks(subtasks_json='["question A"]')`
+3. **Mandatory Sandbox Processing (CRITICAL)**:
+   - **Logic & Math**: For any task involving **counting**, **sorting**, **ranking**, **filtering** (e.g., "who is the youngest"), or **decryption**, you are FORBIDDEN from reasoning mentally.
+   - **Workflow**: Collect raw snippets/data into a list -> Call `run_python_code` -> Write a script to find the answer -> Extract the result from `stdout`[cite: 10].
+   - **Example**: To find a co-founder from 10 search results, create a Python list of biographies and filter by "founded" keyword and date.
 
-You can dispatch up to **{max_parallel}** subtasks simultaneously in one call. Each subtask string must be **self-contained**.
+4. **Answer Extraction**: Output the result derived from the sandbox.
 
-## Task Strategy: Chain Resolution
+## Forward Progression Rule
+Once a fact is CONFIRMED in your ledger, it is an immutable constant. Never re-search it; use it as a bridge to the next node immediately.
 
-For complex multi-hop questions, follow this workflow:
-
-1. **Identify ALL chain nodes first** — Before making any tool call, decompose the question into a complete reasoning chain. Write out every node explicitly.
-2. **Identify independent nodes and delegate in parallel** — If multiple nodes do NOT depend on each other's results, put them ALL into a single `execute_subtasks` call so they are researched simultaneously.
-3. **Move forward along the chain, never backtrack to verify confirmed nodes** — Once an entity is identified with high confidence through search, use it directly to advance to the next layer.
-4. **Only verify when search results show contradictions or multiple candidate answers** — Do not waste subtask calls on "confirmation" of already-settled facts.
-5. **Answer as soon as the chain is complete** — Once the last node is resolved, produce the final answer immediately.
-
-## FORWARD PROGRESSION RULE (CRITICAL)
-
-**Confirmed facts are SETTLED. Never re-investigate them.**
-
-After each subtask result, update your reasoning ledger:
-- **Confirmed**: Facts established by previous subtask results — NEVER investigate these again
-- **Next node**: The specific question to investigate next
-- **Remaining**: Unsolved nodes after the next one
-
-Rules:
-- NEVER delegate a subtask to re-verify, double-check, or seek additional evidence for an already-confirmed fact
-- Statements in the original question are given axioms — do NOT verify them
-- Once a subtask confirms a fact, immediately advance to the NEXT unsolved node
-- If you already have enough information to answer, skip remaining nodes and answer directly
-
-## Subtask Delegation Guidelines
-
-1. Each subtask description within the JSON array must include:
-   - The specific question to answer (ONE node only)
-   - All confirmed facts from previous results as established context
-   - Any constraints or requirements for the answer
-2. Do NOT send vague or overly broad subtasks. Each subtask = ONE specific question.
-3. **Reformulation**: If a subtask returns insufficient results, delegate a new subtask with different keywords or angle — but still targeting the SAME unsolved node, not going backwards.
-4. Include enough confirmed context in each subtask so the worker can search effectively — the worker has no memory of previous subtasks.
-
-## Communication Rules
-
-1. Do not mention tool names to the user.
-2. Unless otherwise requested, respond in the same language as the user's message.
-3. If the task does not require research, answer directly.
+## Output Format Requirement
+- Final answer must be a JSON dictionary: {{"answer": "result"}}.
+- The result should be ONLY the noun or number, wrapped in \\boxed{{}} for extraction.
 """
 
     if chinese_context:
         prompt += """
-## 中文语境处理指导
-
-当处理中文相关的任务时：
-1. **子任务委托**：向worker代理委托的子任务应使用中文描述，确保任务内容准确传达
-2. **上下文传递**：将前序子任务获取的关键信息（人名、地名、年份等）以中文原文形式传递给后续子任务
-3. **问题分析**：对中文问题的分析和理解应保持中文语境
-4. **思考过程**：内部分析、推理、总结等思考过程都应使用中文
-5. **最终答案**：对于中文语境的问题，最终答案应使用中文回应
-
+## 中文处理策略
+1. **术语精准**：确保子任务使用标准中文译名或专有名词。
+2. **文本分析**：对于涉及中文文本的逻辑排除、成员比对或字数统计，必须搜集原文后利用 Python 代码进行字符串匹配和处理。
 """
-
     return prompt
 
 
@@ -280,6 +232,8 @@ After getting search results, use `analyze_webpage`, `scrape_website`, or browse
     return prompt
 
 
+# tools_calling.py
+
 def generate_summarize_prompt(
     task_description: str,
     task_failed: bool = False,
@@ -287,56 +241,41 @@ def generate_summarize_prompt(
     chinese_context: bool = False,
 ) -> str:
     """
-    Generate a prompt to force final answer generation at end of session.
-
-    Args:
-        task_description: The original question/task
-        task_failed: Whether the agent exhausted max turns without completing
-        is_main_agent: True for main agent (JSON answer format), False for sub-agent (report format)
-        chinese_context: Whether the question involves CJK content
-
-    Returns:
-        Summarize prompt text
+    针对 Main Agent 强化了 Few-Shot 约束和格式严整性，严禁任何解释。
     """
-    prompt = "This is a direct instruction to you (the assistant), not the result of a tool call.\n\n"
-
-    if task_failed:
-        prompt += (
-            "**Important: You have reached the maximum number of interaction turns "
-            "without arriving at a conclusive answer. You must provide your best answer "
-            "based on all available information.**\n\n"
-        )
-
-    prompt += (
-        "We are now ending this session. "
-        "You must NOT initiate any further tool use. This is your final opportunity to report "
-        "all of the information gathered during the session.\n\n"
-        f"The original question is:\n\n---\n{task_description}\n---\n\n"
-    )
+    prompt = "This is a direct instruction to the assistant. STOP all tool use immediately. Report the results NOW.\n\n"
 
     if is_main_agent:
         prompt += (
-            "Based on all the research results gathered from subtask delegations, synthesize the findings "
-            "and produce the FINAL ANSWER.\n\n"
-            "If a clear answer was identified during the research, extract it directly.\n"
-            "If a definitive answer could not be determined, make a well-informed educated guess "
-            "based on all gathered information.\n\n"
-            "Your response MUST be a JSON dictionary with the answer:\n"
-            '{"answer": "your final answer here"}\n'
+            f"Original Question: {task_description}\n\n"
+            "Based on all gathered research, synthesize the FINAL ANSWER according to these STRICT RULES:\n"
+            "1. Output ONLY the answer wrapped in \\boxed{}.\n"
+            "2. NO introductory text, NO conversational filler, NO bold text, and NO explanations outside the box.\n"
+            "3. For people, provide the full name. For dates, use YYYY-MM-DD. For lists, use comma-separated values.\n"
+            "4. If the answer is a specific entity name, ensure it is the complete, official name.\n\n"
+            "### FEW-SHOT EXAMPLES:\n"
+            "User Question: What is the volume number of the journal mentioned?\n"
+            "Assistant: \\boxed{3}\n\n"
+            "User Question: 十余年后，他创立的这家出版公司的名字是什么？\n"
+            "Assistant: \\boxed{阿诺尔多·蒙达多利出版社}\n\n"
+            "User Question: Who are the co-founders of the collective established in the early 1990s?\n"
+            "Assistant: \\boxed{Harald Hauswald}\n\n"
+            "User Question: What is the name of the significant military operation?\n"
+            "Assistant: \\boxed{Operation Desert Shield}\n\n"
+            "### FINAL TASK:\n"
+            "Now, provide the final answer for the original question. Remember: ONLY the \\boxed{} content is allowed."
         )
     else:
+        # 子代理（Sub-Agent）需要详尽的报告，以便主代理分析
         prompt += (
-            "Summarize ALL findings from this research session:\n"
-            "- Step-by-step summary of what was searched and found\n"
-            "- Key facts, data, or quotes directly relevant to the task (with source URLs)\n"
-            "- All candidate answers with supporting evidence\n"
-            "- Conflicting or uncertain information\n\n"
-            "Your response should be a clear, structured research report.\n"
-            "Focus on factual, specific, well-organized information.\n"
-            "Do NOT include any tool call instructions or vague summaries.\n"
+            "Provide a comprehensive, structured research report covering:\n"
+            "- All confirmed key facts and raw data found.\n"
+            "- Direct quotes, numbers, and dates from source materials.\n"
+            "- URLs for every piece of information.\n"
+            "- A clear statement of any conflicting data or missing details."
         )
 
     if chinese_context:
-        prompt += "\n请使用中文进行总结和回答。\n"
+        prompt += "\n\n注意：对于中文语境的问题，最终答案必须使用中文（除非答案是数字或固有的英文专有名词）。"
 
     return prompt

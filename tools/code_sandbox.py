@@ -14,11 +14,11 @@ Environment variables:
 """
 
 import asyncio
-import logging
+import agent_logging
 import os
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+logger = agent_logging.getLogger(__name__)
 
 # Get API key
 E2B_API_KEY = os.getenv("E2B_API_KEY")

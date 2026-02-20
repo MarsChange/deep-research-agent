@@ -9,7 +9,7 @@ Environment variables:
 """
 
 import asyncio
-import logging
+import agent_logging
 import os
 from contextlib import AsyncExitStack
 from typing import Any, Optional
@@ -17,7 +17,7 @@ from typing import Any, Optional
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
-logger = logging.getLogger(__name__)
+logger = agent_logging.getLogger(__name__)
 
 
 class PlaywrightMCPSession:

@@ -6,6 +6,9 @@ import os
 import re
 from dataclasses import dataclass
 from inspect import iscoroutinefunction
+import uuid
+from agent_logging.task_logger import TaskLog
+from core.answer_generator import AnswerGenerator
 from typing import (
     Any,
     AsyncIterator,
@@ -18,6 +21,8 @@ from typing import (
     get_origin,
     get_type_hints,
 )
+
+from core.tool_executor import ToolExecutor
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionChunk
@@ -58,34 +63,36 @@ Avoid overanalyzing or listing trivial details that would not materially affect 
 
 ## Knowledge-Based Entity Hypothesis Generation (CRITICAL)
 
-For each descriptive element, indirect reference, or oblique characterization in the question, you MUST leverage your internal knowledge to generate the most likely candidate entities. This step transforms vague multi-hop questions into concrete, targeted research tasks.
+For each descriptive element, indirect reference, or oblique characterization in the question, you MUST leverage your internal knowledge to generate the most likely candidate entities, **especially targeting "long-tail" or niche entities that might not be immediately obvious**. This step transforms vague multi-hop questions into concrete, targeted research tasks.
 
 For each descriptive element in the question:
-1. **Extract the descriptive clue** from the question text
-2. **Propose the most likely candidate entity** based on your broad knowledge
-3. **Explain the match** — briefly state why this candidate fits the description
-4. **Assign confidence** — high / medium / low
-5. **List alternatives** — if multiple candidates are plausible, list the top 2-3 with reasoning for each
+1. **Extract the descriptive clue** from the question text (e.g., "A specific essay from 1834").
+2. **Propose the most likely candidate entity** based on your broad knowledge. **Prioritize specific, less-common titles or names** that match the temporal and contextual markers.
+3. **Multi-hop Linkage Analysis**: Identify the specific "bridge" connecting this entity to the next part of the question. (e.g., "The essay is mentioned in the 'Who Was?' series").
+4. **Explain the match** — briefly state why this candidate fits the description.
+5. **Assign confidence** — high / medium / low.
+6. **List alternatives** — if multiple candidates are plausible, list the top 2-3 with reasoning for each.
 
 **Chain derivation**: Once you identify a high-confidence candidate for one element, immediately use it as a known condition to derive candidates for subsequent elements. Build a complete candidate reasoning chain from the question's starting point to its final target.
 
 After generating all hypotheses, clearly categorize:
-- **High-confidence hypotheses** — can be treated as near-facts, only need quick verification
-- **Medium/low-confidence hypotheses** — require dedicated search effort to confirm or eliminate
-- **Unknown elements** — no strong candidate available, require open-ended search from scratch
+- **High-confidence hypotheses** — can be treated as near-facts, only need quick verification.
+- **Medium/low-confidence hypotheses** — require dedicated search effort to confirm or eliminate.
+- **Unknown elements** — no strong candidate available, require open-ended search from scratch.
 
 ## Reasoning Chain Decomposition (CRITICAL)
 
 If the question involves multi-hop reasoning (requiring multiple information retrieval steps to reach an answer):
 
-1. **Identify the reasoning chain** — Decompose the question into independent sub-questions, each involving exactly ONE specific information retrieval task
-2. **Pre-judge each node using internal knowledge** — For each sub-question, provide the most likely candidate answer based on your existing knowledge, with confidence level
-3. **Provide a search plan for each sub-question**:
-   - Recommended search keywords (3-7 keywords, short and precise)
-   - Alternative keywords (to use if the first search fails)
-4. **Mark dependencies between sub-questions** — Which sub-questions can be searched independently (parallelizable), and which require prior sub-questions to be resolved first (sequential)
-5. **Specify the key fact each sub-question must confirm** — What information must be established at each step before proceeding to the next
-6. **Identify skippable nodes** — If a node's hypothesis has high confidence, recommend the main agent adopt it directly rather than spending time on verification
+1. **Identify the reasoning chain** — Decompose the question into independent sub-questions, each involving exactly ONE specific information retrieval task.
+2. **Handle Multi-hop Dependencies**: Explicitly state which sub-question results are needed to unlock the search query for the next node.
+3. **Pre-judge each node using internal knowledge** — For each sub-question, provide the most likely candidate answer based on your existing knowledge, with confidence level.
+4. **Provide a search plan for each sub-question**:
+   - Recommended search keywords (3-7 keywords, short and precise). **Include the specific "long-tail" entity names discovered in the Hypothesis phase**.
+   - Alternative keywords (to use if the first search fails).
+5. **Mark dependencies between sub-questions** — Which sub-questions can be searched independently (parallelizable), and which require prior sub-questions to be resolved first (sequential).
+6. **Specify the key fact each sub-question must confirm** — What information must be established at each step before proceeding to the next.
+7. **Identify skippable nodes** — If a node's hypothesis has high confidence, recommend the main agent adopt it directly rather than spending time on verification.
 
 Note: Search keywords for each sub-question must be independent — NEVER mix keywords from multiple sub-questions into a single query.
 
@@ -93,42 +100,41 @@ Note: Search keywords for each sub-question must be independent — NEVER mix ke
 
 如果问题涉及中文语境，请特别注意：
 
-- **语言理解**：识别可能存在的中文表达歧义、方言差异或特定语境下的含义
-- **文化背景**：考虑可能需要中文文化背景知识才能正确理解的术语或概念
-- **信息获取**：标注需要使用中文搜索关键词才能获得准确信息的方面
-- **格式要求**：识别中文特有的格式要求、表达习惯或答案形式
-- **翻译风险**：标记直接翻译可能导致误解或信息丢失的关键术语
-- **时效性**：注意中文信息源的时效性和地域性特征
-- **分析输出**：使用中文进行分析和提示，确保语言一致性
+- **语言理解**：识别可能存在的中文表达歧义、方言差异或特定语境下的含义。
+- **文化背景**：考虑可能需要中文文化背景知识才能正确理解的术语或概念。
+- **信息获取**：标注需要使用中文搜索关键词才能获得准确信息的方面。
+- **格式要求**：识别中文特有的格式要求、表达习惯或答案形式。
+- **翻译风险**：标记直接翻译可能导致误解或信息丢失的关键术语。对于长尾实体，优先使用其中文标准译名进行搜索。
+- **分析输出**：使用中文进行分析和提示，确保语言一致性。
+
+
+## Final Output Format Prediction
+Predict if the final answer should be a single number, a specific date, a noun, or a list. 
+Explicitly flag this for the Main Agent to ensure formatting compliance.
+
 
 Here is the question:
 
 """
 
+DEFAULT_SYSTEM_PROMPT = """You are a highly precise research assistant. Your goal is to gather information from the internet and provide direct, concise answers to user questions.
 
-DEFAULT_SYSTEM_PROMPT = """You are an AI assistant designed to help with a variety of tasks. You have access to several tools that can assist you in providing accurate and relevant information.
+Follow these instructions strictly:
+1. **Research Thoroughly**: Use available tools to collect comprehensive information before concluding.
+2. **Be Transparent**: Document all evidence, reasoning steps, and uncertainties internally.
+3. **Format Requirement (CRITICAL)**: 
+   - **DO NOT** wrap your response in a JSON object or any code blocks (e.g., do not use {"answer": "..."}).
+   - **Direct Output Only**: Provide only the raw answer string.
+   - For numerical questions, output only the integer.
+   - For multiple entities, separate them with a comma and a space (", ").
+4. **Standardization**:
+   - Convert all English letters to lowercase.
+   - Remove any leading or trailing whitespace.
+5. **No Explanations**: Provide just the answer itself without conversational filler or introductory phrases.
 
-Your task is to actively gather detailed information from the internet and generate answers to users' questions. Your goal is not to rush to a definitive answer or conclusion, but to collect complete information and present all reasonable candidate answers you find, accompanied by clearly documented supporting evidence, reasoning steps, uncertainty factors, and explicit intermediate findings.
-
-The user has no intention of deliberately setting traps or creating confusion. Please use the most common, reasonable, and direct explanation to handle the task, and do not overthink or focus on rare or far-fetched explanations.
-
-Important Note: - Gather comprehensive information from reliable sources to fully understand all aspects of the issue.
-- Present all possible candidate answers you identified during the information gathering process, regardless of uncertainty, ambiguity, or incomplete verification. Avoid jumping to conclusions or omitting any discovered possibilities.
-- Clearly record the detailed facts, evidence, and reasoning steps supporting each candidate answer, and carefully preserve the intermediate analysis results.
-- During the information collection process, clearly mark and retain all uncertainties, conflicting interpretations, or different understandings that are discovered. Do not arbitrarily discard or resolve these issues on your own.
-- In cases where there is inconsistency, ambiguity, errors, or potential mismatches with general guidelines or provided examples in the explicit instructions of a problem (such as numerical accuracy, formatting, specific requirements), all reasonable explanations and corresponding candidate answers should be clearly documented and presented.
-
-Recognize that the original task description itself may inadvertently contain errors, imprecision, inaccuracy, or conflicts due to user carelessness, misunderstanding, or limited professional knowledge. Do not attempt to internally question or "correct" these instructions; instead, present the survey results transparently based on every reasonable interpretation.
-
-Your goal is to achieve the highest degree of completeness, transparency, and detailed documentation, enabling users to make independent judgments and choose their preferred answers. Even in the presence of uncertainty, explicitly recording the existence of possible answers can significantly enhance the user experience, ensuring that no reasonable solutions are irreversibly omitted due to early misunderstandings or premature filtering.
-
-When generating responses, it is crucial to pay attention to the following points:
-1. Keep your response as concise as possible. The response content should be returned as a JSON dictionary, with the answer to the question corresponding to the key "answer". For example, if the user inputs {"question": "Where is the capital of France?"}, you only need to respond with {"answer": "Paris"}
-2. To minimize misjudgments caused by format differences, the following preprocessing is applied to the output responses:
-- Convert English letters to lowercase;
-- Remove leading and trailing spaces;
-- All numerical questions involve integers;
-- If the answer contains multiple entities, please follow English grammar, with a comma or semicolon followed by a space. The specific symbol should be based on the user's question.
+Example:
+User: "What is the capital of France?"
+Assistant: paris
 """
 
 
@@ -149,9 +155,6 @@ class Chunk:
     content: Optional[str] = None
     tool_call: Optional[ToolCall] = None
     tool_result: Optional[Any] = None
-
-
-# --- Utility Functions ---
 
 
 def python_type_to_json_type(t):
@@ -200,7 +203,8 @@ def parse_docstring(docstring: str) -> dict:
         if stripped.lower() in ("args:", "arguments:", "parameters:", "params:"):
             current_section = "args"
             continue
-        elif stripped.lower() in ("returns:", "return:", "yields:", "raises:", "examples:", "example:", "note:", "notes:"):
+        elif stripped.lower() in (
+                "returns:", "return:", "yields:", "raises:", "examples:", "example:", "note:", "notes:"):
             # Save current param if any
             if current_param and current_param_desc:
                 params[current_param] = " ".join(current_param_desc).strip()
@@ -290,13 +294,13 @@ def _contains_cjk(text: str) -> bool:
             return True
     return False
 
-# --- Sub-Agent Runner ---
+
 async def run_sub_agent(
-    client: AsyncOpenAI,
-    model: str,
-    subtask: str,
-    sub_agent_tool_functions: list,
-    chinese_context: bool = False,
+        client: AsyncOpenAI,
+        model: str,
+        subtask: str,
+        sub_agent_tool_functions: list,
+        chinese_context: bool = False,
 ) -> str:
     """Run the sub-agent worker to complete a research subtask.
 
@@ -447,9 +451,9 @@ async def run_sub_agent(
 
 
 async def agent_loop(
-    input_messages: list,
-    tool_functions: List[Callable],
-    skill_directories: Optional[List[str]] = None,
+        input_messages: list,
+        tool_functions: List[Callable],
+        skill_directories: Optional[List[str]] = None,
 ) -> AsyncIterator[Chunk]:
     """
     Main agent loop with multi-agent architecture.
@@ -464,6 +468,12 @@ async def agent_loop(
         skill_directories: Deprecated, ignored. Kept for API compatibility.
     """
 
+    task_id = str(uuid.uuid4())[:8]
+    task_log = TaskLog(task_id=task_id)
+    executor = ToolExecutor(task_log)
+    task_log.log_step("info", "Main Agent", f"--- 任务开始: {task_id} ---")
+    user_question = next((msg["content"] for msg in reversed(input_messages) if msg["role"] == "user"), "")
+    task_log.log_step("info", "Main Agent", f"任务描述预览: {user_question[:100]}...")
     assert os.getenv("DASHSCOPE_API_KEY"), "DASHSCOPE_API_KEY is not set"
 
     model = os.getenv("QWEN_MODEL") or "qwen-max"
@@ -482,6 +492,7 @@ async def agent_loop(
                 user_question = content
             break
 
+    task_log.log_step("info", "Main Agent", f"收到任务描述: {user_question[:100]}...")
     # --- Detect Chinese context ---
     chinese_context = _contains_cjk(user_question)
 
@@ -514,12 +525,14 @@ async def agent_loop(
 
             analysis_response = analysis_task.result()
             question_analysis = analysis_response.choices[0].message.content or ""
+            task_log.log_step("info", "Main Agent | Phase 0", "预分析完成。")
         except Exception as e:
             logger.warning(f"Phase 0 question pre-analysis failed: {e}, skipping")
+            task_log.log_step("warning", "Main Agent | Phase 0", f"预分析失败: {e}")
 
     # --- Sub-agent tool functions come from SUB_AGENT_TOOLS (imported from tools/) ---
     sub_agent_tool_functions = list(SUB_AGENT_TOOLS)
-    max_parallel = int(os.getenv("SUB_AGENT_NUM", "3"))
+    max_parallel = int(os.getenv("SUB_AGENT_NUM", "10"))
 
     # --- Create execute_subtasks closure (parallel sub-agent dispatch) ---
     async def execute_subtasks(subtasks_json: str) -> str:
@@ -546,31 +559,49 @@ async def agent_loop(
         logger.info(
             f"[Main Agent] Dispatching {len(questions)} subtask(s) in parallel"
         )
+        task_log.log_step(
+            "info",
+            "Main Agent | Dispatch",
+            f"正在并行分发 {len(questions)} 个研究子任务"
+        )
+
+        async def run_wrapped_sub_agent(idx, question):
+            sub_task_id = f"Sub-{idx + 1}"
+            task_log.log_step("info", f"Worker | {sub_task_id}", f"开始处理: {question[:50]}...")
+            try:
+                # 执行原有的 run_sub_agent
+                result = await run_sub_agent(
+                    client=client,
+                    model=model,
+                    subtask=question,
+                    sub_agent_tool_functions=sub_agent_tool_functions,
+                    chinese_context=chinese_context,
+                )
+                task_log.log_step("info", f"Worker | {sub_task_id}", "任务完成")
+                return result
+            except Exception as e:
+                task_log.log_step("error", f"Worker | {sub_task_id}", f"执行失败: {str(e)}")
+                raise e
 
         # Run all sub-agents concurrently
-        tasks = [
-            run_sub_agent(
-                client=client,
-                model=model,
-                subtask=q,
-                sub_agent_tool_functions=sub_agent_tool_functions,
-                chinese_context=chinese_context,
-            )
-            for q in questions
-        ]
+        tasks = [run_wrapped_sub_agent(i, q) for i, q in enumerate(questions)]
+
+        # 按照 MiroThinker 风格，使用 return_exceptions=True 保证部分失败不影响整体
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Format combined results
         output_parts = []
         for i, (q, r) in enumerate(zip(questions, results)):
             if isinstance(r, Exception):
-                output_parts.append(
-                    f"## Subtask {i + 1}\n**Question**: {q}\n**Result**: Error - {str(r)}"
-                )
+                # 记录异常详情
+                error_msg = f"Error - {type(r).__name__}: {str(r)}"
+                output_parts.append(f"## Subtask {i + 1}\n**Question**: {q}\n**Result**: {error_msg}")
             else:
-                output_parts.append(
-                    f"## Subtask {i + 1}\n**Question**: {q}\n**Result**:\n{r}"
-                )
+                # 成功结果
+                output_parts.append(f"## Subtask {i + 1}\n**Question**: {q}\n**Result**:\n{r}")
+
+        # 最终保存一次日志状态
+        task_log.save()
 
         return "\n\n---\n\n".join(output_parts)
 
@@ -622,10 +653,12 @@ async def agent_loop(
     }
 
     step_index = 0
-
+    consecutive_rollbacks = 0  # 连续回退计数器
+    MAX_CONSECUTIVE_ROLLBACKS = 5  # 最大允许回退次数，防止死循环
     # --- Main Agent Loop (bounded) ---
     for turn in range(MAX_MAIN_AGENT_TURNS):
         # Make the streaming request
+        task_log.log_step("info", f"Main Agent | Turn: {turn + 1}", "正在请求 LLM 推理...")
         stream = await client.chat.completions.create(
             messages=prompt_messages,
             **params,
@@ -633,7 +666,7 @@ async def agent_loop(
         )
 
         tool_calls_buffer = {}
-
+        full_assistant_text = ""
         # Process the stream
         async for chunk in stream:  # type: ChatCompletionChunk
             chunk = cast(ChatCompletionChunk, chunk)
@@ -642,6 +675,7 @@ async def agent_loop(
 
             # Case A: Standard text content
             if delta.content:
+                full_assistant_text += delta.content
                 yield Chunk(
                     type="text", content=delta.content, step_index=step_index
                 )
@@ -664,8 +698,27 @@ async def agent_loop(
                             tc_chunk.function.arguments
                         )
 
+        if full_assistant_text:
+            task_log.log_step("debug", "Main Agent | LLM Response", f"文本回复内容预览: {full_assistant_text[:100]}...")
+        invalid_tags = ["<mcp_call>", "</mcp_call>", "<mcp_result>"]
+        is_format_error = any(tag in full_assistant_text for tag in invalid_tags)
+        is_refusal = any(kw in full_assistant_text for kw in ["无法回答", "对不起", "I cannot", "sorry"])
+
+        if is_format_error or is_refusal:
+            if consecutive_rollbacks < MAX_CONSECUTIVE_ROLLBACKS:
+                consecutive_rollbacks += 1
+                task_log.log_step("warning", "Rollback", f"检测到异常输出，执行第 {consecutive_rollbacks} 次回退重试")
+
+                continue
+            else:
+                task_log.log_step("error", "Main Agent", "连续回退次数过多，强制终止当前分支")
+                break
+
+        # 3. 校验通过，重置计数器并处理后续逻辑
+        consecutive_rollbacks = 0
         # If no tool calls, the model returned a final text response
         if not tool_calls_buffer:
+            task_log.log_step("info", "Main Agent", "模型给出了最终回复，循环结束。")
             break
 
         assistant_tool_calls_data = []
@@ -692,124 +745,145 @@ async def agent_loop(
             }
         )
 
-        # Execute tools and yield results — parallel for async tools
-        # Phase 1: Parse all tool calls and yield tool_call notifications
-        parsed_tool_calls = []  # (call_id, func_name, parsed_args, tool_call, error_msg)
-        for tool_data in assistant_tool_calls_data:
-            call_id = tool_data["id"]
-            func_name = tool_data["function"]["name"]
-            func_args_str = tool_data["function"]["arguments"]
+        # # Execute tools and yield results — parallel for async tools
+        # # Phase 1: Parse all tool calls and yield tool_call notifications
+        # parsed_tool_calls = []  # (call_id, func_name, parsed_args, tool_call, error_msg)
+        # for tool_data in assistant_tool_calls_data:
+        #     call_id = tool_data["id"]
+        #     func_name = tool_data["function"]["name"]
+        #     func_args_str = tool_data["function"]["arguments"]
+        #     task_log.log_step("info", "Main Agent | Tool Call Start",
+        #                       f"准备执行工具: {func_name} | 参数: {func_args_str}")
+        #     tool_call = ToolCall(
+        #         tool_call_id=call_id,
+        #         tool_name=func_name,
+        #         tool_arguments={},
+        #     )
+        #
+        #     try:
+        #         parsed_args = json.loads(func_args_str)
+        #         tool_call.tool_arguments = parsed_args
+        #         yield Chunk(
+        #             step_index=step_index,
+        #             type="tool_call",
+        #             tool_call=tool_call,
+        #         )
+        #         parsed_tool_calls.append(
+        #             (call_id, func_name, parsed_args, tool_call, None)
+        #         )
+        #     except json.JSONDecodeError as e:
+        #         error_msg = f"Error: Failed to parse tool arguments JSON: {func_args_str}. Error: {e}"
+        #         yield Chunk(
+        #             step_index=step_index,
+        #             type="tool_call",
+        #             tool_call=tool_call,
+        #         )
+        #         parsed_tool_calls.append(
+        #             (call_id, func_name, {}, tool_call, error_msg)
+        #         )
+        #
+        # # Phase 2: Launch all tools — async ones run concurrently
+        # async_tasks = {}  # call_id -> asyncio.Task
+        # sync_results = {}  # call_id -> result string
+        #
+        # for call_id, func_name, parsed_args, tool_call, error_msg in parsed_tool_calls:
+        #     if error_msg:
+        #         sync_results[call_id] = error_msg
+        #         continue
+        #
+        #     if func_name not in tool_functions_map:
+        #         sync_results[call_id] = f"Error: Tool '{func_name}' not found."
+        #         continue
+        #
+        #     func = tool_functions_map[func_name]
+        #     task_log.log_step("debug", f"Main Agent | Tool Executing", f"正在调用 API/沙箱: {func_name}")
+        #     if iscoroutinefunction(func):
+        #         async_tasks[call_id] = asyncio.create_task(func(**parsed_args))
+        #     else:
+        #         # Run sync tools in thread to avoid blocking event loop
+        #         async_tasks[call_id] = asyncio.create_task(
+        #             asyncio.to_thread(func, **parsed_args)
+        #         )
+        #
+        # # Wait for all async tasks with periodic keepalive
+        # if async_tasks:
+        #     pending = set(async_tasks.values())
+        #     while pending:
+        #         _, pending = await asyncio.wait(pending, timeout=30)
+        #         if pending:
+        #             yield Chunk(
+        #                 type="text", content="", step_index=step_index
+        #             )
+        #
+        #     # Collect async results
+        #     for call_id, task in async_tasks.items():
+        #         try:
+        #             sync_results[call_id] = str(task.result())
+        #         except Exception as e:
+        #             sync_results[call_id] = f"Error: Execution failed - {str(e)}"
+        #
+        # # Phase 3: Yield all results and update message history
+        # for call_id, func_name, parsed_args, tool_call, error_msg in parsed_tool_calls:
+        #     tool_result_content = sync_results[call_id]
+        #     task_log.log_step("info", "Main Agent | Tool Call Success",
+        #                       f"工具 {func_name} 返回长度: {len(tool_result_content)}")
+        #     yield Chunk(
+        #         type="tool_call_result",
+        #         tool_result=tool_result_content,
+        #         step_index=step_index,
+        #         tool_call=tool_call,
+        #     )
+        #
+        #     prompt_messages.append(
+        #         {
+        #             "role": "tool",
+        #             "tool_call_id": call_id,
+        #             "content": tool_result_content,
+        #         }
+        #     )
+        tool_results = await executor.execute_tool_batch(
+            tool_calls_data=assistant_tool_calls_data,
+            tool_functions_map=tool_functions_map,
+            agent_name="Main Agent",
+            turn_count=turn + 1
+        )
 
-            tool_call = ToolCall(
-                tool_call_id=call_id,
-                tool_name=func_name,
-                tool_arguments={},
-            )
+        # 4. 更新消息历史并持久化
+        # tool_results 已经是格式化好的 [{"role": "tool", ...}, ...] 列表
+        for result_msg in tool_results:
+            prompt_messages.append(result_msg)
 
-            try:
-                parsed_args = json.loads(func_args_str)
-                tool_call.tool_arguments = parsed_args
-                yield Chunk(
-                    step_index=step_index,
-                    type="tool_call",
-                    tool_call=tool_call,
-                )
-                parsed_tool_calls.append(
-                    (call_id, func_name, parsed_args, tool_call, None)
-                )
-            except json.JSONDecodeError as e:
-                error_msg = f"Error: Failed to parse tool arguments JSON: {func_args_str}. Error: {e}"
-                yield Chunk(
-                    step_index=step_index,
-                    type="tool_call",
-                    tool_call=tool_call,
-                )
-                parsed_tool_calls.append(
-                    (call_id, func_name, {}, tool_call, error_msg)
-                )
-
-        # Phase 2: Launch all tools — async ones run concurrently
-        async_tasks = {}  # call_id -> asyncio.Task
-        sync_results = {}  # call_id -> result string
-
-        for call_id, func_name, parsed_args, tool_call, error_msg in parsed_tool_calls:
-            if error_msg:
-                sync_results[call_id] = error_msg
-                continue
-
-            if func_name not in tool_functions_map:
-                sync_results[call_id] = f"Error: Tool '{func_name}' not found."
-                continue
-
-            func = tool_functions_map[func_name]
-            if iscoroutinefunction(func):
-                async_tasks[call_id] = asyncio.create_task(func(**parsed_args))
-            else:
-                # Run sync tools in thread to avoid blocking event loop
-                async_tasks[call_id] = asyncio.create_task(
-                    asyncio.to_thread(func, **parsed_args)
-                )
-
-        # Wait for all async tasks with periodic keepalive
-        if async_tasks:
-            pending = set(async_tasks.values())
-            while pending:
-                _, pending = await asyncio.wait(pending, timeout=30)
-                if pending:
-                    yield Chunk(
-                        type="text", content="", step_index=step_index
-                    )
-
-            # Collect async results
-            for call_id, task in async_tasks.items():
-                try:
-                    sync_results[call_id] = str(task.result())
-                except Exception as e:
-                    sync_results[call_id] = f"Error: Execution failed - {str(e)}"
-
-        # Phase 3: Yield all results and update message history
-        for call_id, func_name, parsed_args, tool_call, error_msg in parsed_tool_calls:
-            tool_result_content = sync_results[call_id]
-
+            # 为了兼容原有的 Chunk 输出，可以从 result_msg 中提取数据 yield
             yield Chunk(
                 type="tool_call_result",
-                tool_result=tool_result_content,
+                tool_result=result_msg["content"],
                 step_index=step_index,
-                tool_call=tool_call,
-            )
-
-            prompt_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": tool_result_content,
-                }
+                # tool_call 信息可从 assistant_tool_calls_data 匹配
             )
         step_index += 1
+        task_log.save()
     else:
         # Reached max turns — inject summarize prompt for final answer
         logger.warning(
             f"Main agent reached max turns ({MAX_MAIN_AGENT_TURNS}), generating summary"
         )
-        summarize = generate_summarize_prompt(
+        task_log.log_step("warning", "Main Agent", f"已达到最大轮次 ({MAX_MAIN_AGENT_TURNS})，开始生成失败分析报告")
+        ans_gen = AnswerGenerator(client, model, task_log)
+        ans_gen = AnswerGenerator(client, model, task_log)
+        # 生成结构化复盘内容
+        summary = await ans_gen.generate_failure_summary(
             task_description=user_question,
-            task_failed=True,
-            is_main_agent=True,
-            chinese_context=chinese_context,
+            message_history=prompt_messages
         )
-        prompt_messages.append({"role": "user", "content": summarize})
 
-        # Final LLM call without toodi
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=prompt_messages,
-            stream=True,
-            # extra_body={"enable_thinking": True},
+        # 将总结存入 TaskLog 的 error 字段并持久化
+        task_log.error = summary
+        task_log.save()
+
+        yield Chunk(
+            type="text",
+            content=f"\n\n### 💡 任务失败经验复盘\n{summary}",
+            step_index=step_index
         )
-        async for chunk in stream:
-            chunk = cast(ChatCompletionChunk, chunk)
-            delta = chunk.choices[0].delta
-            if delta.content:
-                yield Chunk(
-                    type="text", content=delta.content, step_index=step_index
-                )
+    task_log.log_step("info", "Main Agent", "任务流程全部结束。")
+    task_log.save()
