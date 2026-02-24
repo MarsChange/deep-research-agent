@@ -40,71 +40,6 @@ logger = logging.getLogger(__name__)
 MAX_MAIN_AGENT_TURNS = 30
 MAX_SUB_AGENT_TURNS = 25
 
-QUESTION_ANALYSIS_PROMPT = """Carefully analyze the given task description (question) without attempting to solve it directly. Your role is to identify potential challenges and areas that require special attention during the solving process, and provide practical guidance for someone who will solve this task by actively gathering and analyzing information from the web.
-
-Identify and concisely list key points in the question that could potentially impact subsequent information collection or the accuracy and completeness of the problem solution, especially those likely to cause mistakes, carelessness, or confusion during problem-solving.
-
-The question author does not intend to set traps or intentionally create confusion. Interpret the question in the most common, reasonable, and straightforward manner, without speculating about hidden meanings or unlikely scenarios. However, be aware that mistakes, imprecise wording, or inconsistencies may exist due to carelessness or limited subject expertise, rather than intentional ambiguity.
-
-Additionally, when considering potential answers or interpretations, note that question authors typically favor more common and familiar expressions over overly technical, formal, or obscure terminology. They generally prefer straightforward and common-sense interpretations rather than being excessively cautious or academically rigorous in their wording choices.
-
-Also, consider additional flagging issues such as:
-- Potential mistakes or oversights introduced unintentionally by the question author due to his misunderstanding, carelessness, or lack of attention to detail.
-- Terms or instructions that might have multiple valid interpretations due to ambiguity, imprecision, outdated terminology, or subtle wording nuances.
-- Numeric precision, rounding requirements, formatting, or units that might be unclear, erroneous, or inconsistent with standard practices or provided examples.
-- Contradictions or inconsistencies between explicit textual instructions and examples or contextual clues provided within the question itself.
-
-Avoid overanalyzing or listing trivial details that would not materially affect the task outcome.
-
-## Knowledge-Based Entity Hypothesis Generation (CRITICAL)
-
-For each descriptive element, indirect reference, or oblique characterization in the question, you MUST leverage your internal knowledge to generate the most likely candidate entities. This step transforms vague multi-hop questions into concrete, targeted research tasks.
-
-For each descriptive element in the question:
-1. **Extract the descriptive clue** from the question text
-2. **Propose the most likely candidate entity** based on your broad knowledge
-3. **Explain the match** — briefly state why this candidate fits the description
-4. **Assign confidence** — high / medium / low
-5. **List alternatives** — if multiple candidates are plausible, list the top 2-3 with reasoning for each
-
-**Chain derivation**: Once you identify a high-confidence candidate for one element, immediately use it as a known condition to derive candidates for subsequent elements. Build a complete candidate reasoning chain from the question's starting point to its final target.
-
-After generating all hypotheses, clearly categorize:
-- **High-confidence hypotheses** — can be treated as near-facts, only need quick verification
-- **Medium/low-confidence hypotheses** — require dedicated search effort to confirm or eliminate
-- **Unknown elements** — no strong candidate available, require open-ended search from scratch
-
-## Reasoning Chain Decomposition (CRITICAL)
-
-If the question involves multi-hop reasoning (requiring multiple information retrieval steps to reach an answer):
-
-1. **Identify the reasoning chain** — Decompose the question into independent sub-questions, each involving exactly ONE specific information retrieval task
-2. **Pre-judge each node using internal knowledge** — For each sub-question, provide the most likely candidate answer based on your existing knowledge, with confidence level
-3. **Provide a search plan for each sub-question**:
-   - Recommended search keywords (3-7 keywords, short and precise)
-   - Alternative keywords (to use if the first search fails)
-4. **Mark dependencies between sub-questions** — Which sub-questions can be searched independently (parallelizable), and which require prior sub-questions to be resolved first (sequential)
-5. **Specify the key fact each sub-question must confirm** — What information must be established at each step before proceeding to the next
-6. **Identify skippable nodes** — If a node's hypothesis has high confidence, recommend the main agent adopt it directly rather than spending time on verification
-
-Note: Search keywords for each sub-question must be independent — NEVER mix keywords from multiple sub-questions into a single query.
-
-## 中文分析指导
-
-如果问题涉及中文语境，请特别注意：
-
-- **语言理解**：识别可能存在的中文表达歧义、方言差异或特定语境下的含义
-- **文化背景**：考虑可能需要中文文化背景知识才能正确理解的术语或概念
-- **信息获取**：标注需要使用中文搜索关键词才能获得准确信息的方面
-- **格式要求**：识别中文特有的格式要求、表达习惯或答案形式
-- **翻译风险**：标记直接翻译可能导致误解或信息丢失的关键术语
-- **时效性**：注意中文信息源的时效性和地域性特征
-- **分析输出**：使用中文进行分析和提示，确保语言一致性
-
-Here is the question:
-
-"""
-
 
 DEFAULT_SYSTEM_PROMPT = """You are an AI assistant designed to help with a variety of tasks. You have access to several tools that can assist you in providing accurate and relevant information.
 
@@ -486,36 +421,7 @@ async def agent_loop(
     chinese_context = _contains_cjk(user_question)
 
     # Yield an initial chunk immediately so the SSE connection has data
-    # and the client won't idle-timeout during Phase 0 pre-analysis
     yield Chunk(type="text", content="", step_index=0)
-
-    # --- Phase 0: Question Pre-Analysis (optional, controlled by ENABLE_QUESTION_ANALYSIS) ---
-    question_analysis = ""
-    enable_analysis = os.getenv("ENABLE_QUESTION_ANALYSIS", "true").lower() in ("true", "1", "yes")
-    if enable_analysis and user_question:
-        try:
-            analysis_task = asyncio.create_task(
-                client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": f"{QUESTION_ANALYSIS_PROMPT}{user_question}",
-                        }
-                    ],
-                )
-            )
-            # Wait with periodic keepalive to prevent SSE timeout
-            pending = {analysis_task}
-            while pending:
-                _, pending = await asyncio.wait(pending, timeout=15)
-                if pending:
-                    yield Chunk(type="text", content="", step_index=0)
-
-            analysis_response = analysis_task.result()
-            question_analysis = analysis_response.choices[0].message.content or ""
-        except Exception as e:
-            logger.warning(f"Phase 0 question pre-analysis failed: {e}, skipping")
 
     # --- Sub-agent tool functions come from SUB_AGENT_TOOLS (imported from tools/) ---
     sub_agent_tool_functions = list(SUB_AGENT_TOOLS)
@@ -596,19 +502,6 @@ async def agent_loop(
         prompt_messages.insert(
             0,
             {"role": "system", "content": system_prompt},
-        )
-
-    # Inject question pre-analysis as context
-    if question_analysis:
-        prompt_messages.append(
-            {
-                "role": "user",
-                "content": (
-                    f"<question_analysis>\n{question_analysis}\n</question_analysis>\n\n"
-                    "Based on the above analysis, now solve the original question. "
-                    "Start by outlining your decomposition plan, then delegate subtasks step by step."
-                ),
-            }
         )
 
     # --- Build tool schema and function map ---
