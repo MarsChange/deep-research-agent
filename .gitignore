@@ -1,6 +1,7 @@
 .env
 test
 .DS_Store
+.vscode
 CLAUDE.md
 answers
 __pycache__
