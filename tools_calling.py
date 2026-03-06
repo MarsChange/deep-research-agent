@@ -279,3 +279,4 @@ def generate_summarize_prompt(
         prompt += "\n\n注意：对于中文语境的问题，最终答案必须使用中文（除非答案是数字或固有的英文专有名词）。"
 
     return prompt
+
