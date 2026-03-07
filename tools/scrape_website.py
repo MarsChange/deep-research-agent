@@ -1,24 +1,19 @@
+"""
+Website scraping tool using Jina Reader API with fallback to requests + MarkItDown.
+
+Requires JINA_API_KEY environment variable. Optionally uses JINA_READER_URL.
+"""
+
 import io
-import agent_logging
+import logging
 import os
-import random
-import time
+import re
 from typing import Optional
 
 import requests
 from markitdown import MarkItDown
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
 
-logger = agent_logging.getLogger(__name__)
-
-# 1. 引入 User-Agent 轮换池，降低被封禁风险
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1"
-]
+logger = logging.getLogger(__name__)
 
 # Patterns that indicate Jina returned a blocked/invalid page
 _JINA_BLOCKED_PATTERNS = [
@@ -32,35 +27,90 @@ _JINA_BLOCKED_PATTERNS = [
 
 
 def _is_blocked_content(content: str) -> bool:
+    """Check if content looks like a CAPTCHA/anti-bot page rather than real content."""
     if len(content.strip()) < 200:
         return True
     return any(pattern in content for pattern in _JINA_BLOCKED_PATTERNS)
 
 
-def _get_retry_session():
-    """创建一个带有自动重试逻辑的请求会话"""
-    session = requests.Session()
-    retry = Retry(
-        total=3,  # 最大重试次数
-        backoff_factor=1,  # 指数退避间隔
-        status_forcelist=[500, 502, 503, 504],  # 针对这些状态码进行重试
-        raise_on_status=False
+def _clean_scraped_markdown(text: str) -> str:
+    """Remove noisy web elements from scraped markdown to reduce token count.
+
+    Strips images, hyperlinks (keeping display text), navigation elements,
+    Jina metadata headers, cookie/privacy banners, social media widgets,
+    and other non-content boilerplate.
+    """
+    # --- Jina metadata header lines ---
+    text = re.sub(r'^Title:.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^URL Source:.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^Published Time:.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^Markdown Content:.*$', '', text, flags=re.MULTILINE)
+
+    # --- Images ---
+    # Linked images: [![alt](img_url)](page_url)
+    text = re.sub(r'\[!\[.*?\]\(.*?\)\]\(.*?\)', '', text)
+    # Standalone images: ![alt](url)
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+
+    # --- Hyperlinks: keep display text, remove URL ---
+    # [display text](url) → display text
+    text = re.sub(r'\[([^\[\]]+)\]\(https?://[^\)]*\)', r'\1', text)
+    # [display text](relative/path) → display text
+    text = re.sub(r'\[([^\[\]]+)\]\(/[^\)]*\)', r'\1', text)
+    # [display text](#anchor) → display text
+    text = re.sub(r'\[([^\[\]]+)\]\(#[^\)]*\)', r'\1', text)
+
+    # --- Bare URLs on their own line ---
+    text = re.sub(r'^\s*https?://\S+\s*$', '', text, flags=re.MULTILINE)
+
+    # --- HTML remnants ---
+    # Inline HTML tags
+    text = re.sub(r'<(?:img|iframe|script|style|link|meta|noscript|svg|video|audio|source|picture|embed|object)[^>]*/?>', '', text, flags=re.IGNORECASE)
+    # Block HTML tags with content
+    text = re.sub(r'<(script|style|noscript|svg)\b[^>]*>.*?</\1>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Data attributes and aria labels (often left as noise)
+    text = re.sub(r'\s+(?:data-\w+|aria-\w+)="[^"]*"', '', text)
+
+    # --- Navigation / boilerplate lines ---
+    # Lines that are just "Skip to content", "Menu", "Close", "Toggle navigation", etc.
+    text = re.sub(
+        r'^\s*(?:Skip to (?:main )?content|Toggle (?:navigation|menu)|'
+        r'Close menu|Open menu|Back to top|'
+        r'Cookie (?:Policy|Settings|Preferences)|Accept (?:all )?cookies|'
+        r'Privacy Policy|Terms (?:of (?:Service|Use))|'
+        r'Share (?:on|this)|Tweet|Pin it|'
+        r'Follow us|Subscribe|Newsletter|'
+        r'Previous|Next|Read more|Show more|Load more|'
+        r'©\s*\d{4}.*$)\s*$',
+        '', text, flags=re.MULTILINE | re.IGNORECASE
     )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+
+    # --- Citation references like [1], [2], [edit], [citation needed] ---
+    text = re.sub(r'\[\d+\]', '', text)
+    text = re.sub(r'\[edit\]', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[citation needed\]', '', text, flags=re.IGNORECASE)
+
+    # --- Empty markdown table separators ---
+    text = re.sub(r'^\|[\s\-\|:]+\|$', '', text, flags=re.MULTILINE)
+    # Empty table rows
+    text = re.sub(r'^\|\s*\|\s*$', '', text, flags=re.MULTILINE)
+
+    # --- Excessive whitespace ---
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Lines with only whitespace
+    text = re.sub(r'^\s+$', '', text, flags=re.MULTILINE)
+
+    return text.strip()
 
 
 def _scrape_by_jina(url: str) -> tuple[Optional[str], Optional[str]]:
+    """Scrape using Jina Reader API. Returns (content, None) or (None, error)."""
     jina_api_key = os.getenv("JINA_API_KEY", "")
     if not jina_api_key:
         return None, "JINA_API_KEY is not set"
 
     jina_reader_url = os.getenv("JINA_READER_URL", "https://r.jina.ai")
     jina_url = f"{jina_reader_url}/{url}"
-
-    # 保持 Jina 推荐的高级渲染配置
     jina_headers = {
         "Authorization": f"Bearer {jina_api_key}",
         "X-Base": "final",
@@ -72,8 +122,7 @@ def _scrape_by_jina(url: str) -> tuple[Optional[str], Optional[str]]:
 
     try:
         logger.info(f"Jina scraping: {url}")
-        session = _get_retry_session()
-        response = session.get(jina_url, headers=jina_headers, timeout=45)
+        response = requests.get(jina_url, headers=jina_headers, timeout=30)
 
         if response.status_code == 422:
             return None, "Jina 422: URL may point to a file, not supported"
@@ -81,83 +130,103 @@ def _scrape_by_jina(url: str) -> tuple[Optional[str], Optional[str]]:
         response.raise_for_status()
         content = response.text
 
+        # Jina sometimes returns a partial page; retry once with longer timeout
         if "Warning: This page maybe not yet fully loaded" in content:
-            logger.info(f"Jina: page not fully loaded, retrying with longer timeout: {url}")
-            time.sleep(2)  # 稍微等待
-            response = session.get(jina_url, headers=jina_headers, timeout=60)
+            logger.info(f"Jina: page not fully loaded, retrying: {url}")
+            response = requests.get(jina_url, headers=jina_headers, timeout=60)
             response.raise_for_status()
             content = response.text
 
+        # Check if we got a real page or a CAPTCHA/blocked page
         if _is_blocked_content(content):
             return None, f"Jina returned blocked/CAPTCHA page for {url}"
 
+        content = _clean_scraped_markdown(content)
+        logger.info(f"Jina success: {url} ({len(content)} chars after cleaning)")
         return content, None
 
+    except requests.exceptions.ConnectionError as e:
+        return None, f"Jina connection failed (network unreachable?): {e}"
+    except requests.exceptions.HTTPError as e:
+        return None, f"Jina HTTP error: {e}"
+    except requests.exceptions.Timeout:
+        return None, f"Jina request timed out (30s) for {url}"
     except Exception as e:
-        return None, f"Jina scraping failed: {str(e)}"
+        return None, f"Jina scraping failed: {e}"
 
 
 def _scrape_request(url: str) -> tuple[Optional[str], Optional[str]]:
-    """增强版回退抓取：使用随机 UA 和重试 Session"""
+    """Fallback scraping using requests + MarkItDown. Returns (content, None) or (None, error)."""
     try:
         headers = {
-            "User-Agent": random.choice(_USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            )
         }
-
         logger.info(f"Requests fallback scraping: {url}")
-        session = _get_retry_session()
-        response = session.get(url, headers=headers, timeout=60, allow_redirects=True)
-
-        # 专门处理 403 错误，引导 Agent 使用浏览器工具
-        if response.status_code == 403:
-            return None, "Error 403: Access Forbidden. This site might require browser_navigate to bypass anti-bot."
-
+        response = requests.get(url, headers=headers, timeout=60)
         response.raise_for_status()
 
+        # Try converting to markdown first
         try:
             stream = io.BytesIO(response.content)
             md = MarkItDown()
             content = md.convert_stream(stream).text_content
             if content and len(content.strip()) > 50:
-                return content, None
-        except Exception as e:
-            logger.warning(f"MarkItDown conversion failed: {e}")
+                return _clean_scraped_markdown(content), None
+        except Exception:
+            pass
 
+        # Fall back to raw HTML text
         if response.text and len(response.text.strip()) > 50:
-            return response.text, None
+            return _clean_scraped_markdown(response.text), None
 
         return None, "Page content is empty or too short"
 
+    except requests.exceptions.ConnectionError as e:
+        return None, f"Connection failed (network unreachable?): {e}"
+    except requests.exceptions.HTTPError as e:
+        return None, f"HTTP error: {e}"
+    except requests.exceptions.Timeout:
+        return None, f"Request timed out (60s) for {url}"
     except Exception as e:
         return None, str(e)
 
 
 def scrape_website(url: str) -> str:
+    """
+    Scrape and extract readable content from a webpage. Converts HTML to clean markdown text using Jina Reader API with fallback to direct requests. Use this to read the full content of a webpage.
+
+    Args:
+        url: The URL of the website to scrape (e.g. 'https://example.com/page').
+
+    Returns:
+        The webpage content converted to markdown text, or an error message.
+    """
     if not url:
-        return "Error: URL is empty."
+        return "Error: URL is empty. Please provide a valid URL."
 
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
-    # 屏蔽已知无法抓取的域名
-    if any(domain in url for domain in ["huggingface.co/datasets", "huggingface.co/spaces"]):
-        return "Error: Cannot scrape this specific platform. Use other tools."
+    if "huggingface.co/datasets" in url or "huggingface.co/spaces" in url:
+        return "Error: Cannot scrape Hugging Face datasets/spaces. Use other tools for this."
 
-    # 优先尝试 Jina
+    # Try Jina Reader first (Jina servers can access foreign sites even from China)
     content, jina_error = _scrape_by_jina(url)
     if content is not None:
         return content
 
     logger.warning(f"Jina failed ({jina_error}), falling back to requests: {url}")
 
-    # 回退到增强版 requests
+    # Fallback to requests + MarkItDown (needs direct network access or proxy)
     content, req_error = _scrape_request(url)
     if content is not None:
         return content
 
-    return f"Error: All scraping methods failed.\nJina: {jina_error}\nRequests: {req_error}"
+    return f"Error: Both scraping methods failed.\nJina: {jina_error}\nRequests: {req_error}"
 
 
 SCRAPE_WEBSITE_TOOLS = []

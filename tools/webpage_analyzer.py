@@ -15,13 +15,13 @@ Environment variables:
 """
 
 import asyncio
-import agent_logging
+import logging
 import os
 from typing import Optional
 
 from openai import AsyncOpenAI
 
-logger = agent_logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 # Max content length to send to LLM (characters)
 MAX_CONTENT_LENGTH = 15000
