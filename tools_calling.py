@@ -303,7 +303,7 @@ If the search result snippets (titles, descriptions, answer boxes, knowledge gra
 - **人名必须使用完整全名**（姓+名），不要只写姓或只写名。
 - **组织/机构名称必须使用完整官方全称**，不要使用缩写或简称。
 - **地名、作品名等也必须使用完整正式名称**。
-- **若原始问题指定了输出格式**（如“要求格式形如”、“只回答年份”、“请用中文全称回答”、“Answer with first name and last name only”等），请在报告中明确标注该格式要求，确保主代理能够精确遵循。
+- **若原始问题指定了输出格式，请在报告中明确标注该格式要求，确保主代理能够精确遵循。
 
 """
 
@@ -364,6 +364,7 @@ def generate_summarize_prompt(
             "4. **Numerical answers must be integers** unless the question explicitly involves decimals.\n"
             "5. **Lowercase**: Convert all English letters in the answer to lowercase.\n"
             "6. **Strip whitespace**: Remove any leading and trailing spaces from the answer.\n\n"
+            "## IMPORTANT: The language of the final output answer must be consistent with the question, for example, for questions asked in Chinese, the answer should be output in Chinese, and for questions asked in English, the answer should be output in English.\n\n"
             "## IMPORTANT: Your response MUST be a JSON dictionary with the answer:\n"
             '{"answer": "your final answer here"}\n'
         )

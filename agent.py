@@ -1,10 +1,12 @@
+import asyncio
 import json
-from typing import Optional
+import re
+from typing import AsyncIterator, Optional
 
 from ag_ui.core import RunAgentInput
 from agent_loop import agent_loop
 from agui import stream_agui_events, to_openai_messages, to_sse_data
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -15,6 +17,10 @@ except ImportError:
     MAIN_AGENT_TOOLS = []
 
 app = FastAPI()
+
+# Sub-agent progress message prefixes (should not appear in final answer)
+_PROGRESS_PREFIXES = ("🔍", "⚙️", "✅", "📊", "💬", "⏳", "⚠️")
+
 
 class QueryRequest(BaseModel):
     model_config = ConfigDict(
@@ -41,88 +47,145 @@ class QueryResponse(BaseModel):
     answer: str
 
 
-@app.post("/")
-async def query(req: QueryRequest) -> QueryResponse:
+# ---------------------------------------------------------------------------
+# SSE heartbeat interleaving (from LangStudio llm-basic template)
+# ---------------------------------------------------------------------------
+
+async def stream_with_heartbeat(
+    messages: AsyncIterator[str], ping_interval: int = 5
+) -> AsyncIterator[str]:
+    """Interleave an SSE message stream with periodic Ping heartbeats."""
+
+    async def ping(interval: int) -> AsyncIterator[str]:
+        while True:
+            yield "event: Ping\n\n"
+            await asyncio.sleep(interval)
+
+    ping_gen = ping(ping_interval)
+    message_task = asyncio.create_task(anext(messages), name="message")
+    ping_task = asyncio.create_task(anext(ping_gen), name="ping")
+
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                {message_task, ping_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if ping_task in done:
+                yield ping_task.result()
+                ping_task = asyncio.create_task(anext(ping_gen), name="ping")
+
+            if message_task in done:
+                try:
+                    yield message_task.result()
+                except StopAsyncIteration:
+                    break
+                message_task = asyncio.create_task(anext(messages), name="message")
+    finally:
+        for task in (message_task, ping_task):
+            task.cancel()
+        await asyncio.gather(message_task, ping_task, return_exceptions=True)
+
+        for gen in (messages, ping_gen):
+            aclose = getattr(gen, "aclose", None)
+            if callable(aclose):
+                await aclose()
+
+
+# ---------------------------------------------------------------------------
+# Answer extraction
+# ---------------------------------------------------------------------------
+
+def _extract_answer(raw: str) -> str:
+    """Extract the answer value from LLM output.
+
+    The LLM is instructed to output {"answer": "..."} JSON.
+    This function extracts the value; falls back to the raw text.
     """
-    Basic LLM API example.
-
-    Invoke example:
-
-    ```
-    curl -X POST "http://localhost:8000/" \
-    -H "Content-Type: application/json" \
-    -d '{"question": "What is the weather in Beijing today?"}'
-
-    ```
-
-    Response example:
-
-    ```json
-    {
-        "answer": "Beijing has sunny weather today, with temperatures between 10°C and 20°C."
-    }
-    ```
+    raw = raw.strip()
+    # Try parsing the whole text as JSON
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and "answer" in parsed:
+            return str(parsed["answer"])
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Try regex extraction for {"answer": "..."}
+    match = re.search(r'\{\s*"answer"\s*:\s*"(.*?)"\s*\}', raw, re.DOTALL)
+    if match:
+        return match.group(1)
+    return raw
 
 
+# ---------------------------------------------------------------------------
+# Message generator — buffers text, emits final answer as Message event
+# ---------------------------------------------------------------------------
+
+async def _query_message_chunks(req: QueryRequest) -> AsyncIterator[str]:
+    """Consume agent_loop, yield SSE Message event(s) for the final answer only.
+
+    During the research phase this generator blocks (yielding nothing), so
+    ``stream_with_heartbeat`` keeps sending Ping events. Once the answer is
+    ready it is yielded as ``event: Message``.
     """
+    answer_buffer = ""
 
-    result = ""
-
-    # Return messages after the last tool call message as the final answer
     async for chunk in agent_loop(req.to_messages(), MAIN_AGENT_TOOLS):
-        if chunk.type == "tool_call" or chunk.type == "tool_call_result":
-            result = ""
+        if chunk.type in ("tool_call", "tool_call_result"):
+            # Reset — text before tool calls is intermediate reasoning
+            answer_buffer = ""
         elif chunk.type == "text" and chunk.content:
-            result += chunk.content
+            # Skip sub-agent progress messages
+            if not chunk.content.lstrip().startswith(_PROGRESS_PREFIXES):
+                answer_buffer += chunk.content
 
-    return QueryResponse(answer=result)
+    # Emit the final answer
+    answer = _extract_answer(answer_buffer)
+    data = json.dumps({"answer": answer}, ensure_ascii=False)
+    yield f"event: Message\ndata: {data}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/", response_model=QueryResponse)
+async def query(req: QueryRequest, request: Request):
+    """
+    Supports both JSON and streaming SSE responses.
+
+    When the request includes ``Accept: text/event-stream``, the response is
+    streamed as Server-Sent Events with periodic Ping heartbeats.
+    Otherwise a plain JSON ``{"answer": "..."}`` is returned.
+    """
+
+    accept = request.headers.get("accept", "")
+    if "text/event-stream" in accept:
+        return StreamingResponse(
+            stream_with_heartbeat(_query_message_chunks(req)),
+            media_type="text/event-stream",
+        )
+    else:
+        result = ""
+
+        async for chunk in agent_loop(req.to_messages(), MAIN_AGENT_TOOLS):
+            if chunk.type == "tool_call" or chunk.type == "tool_call_result":
+                result = ""
+            elif chunk.type == "text" and chunk.content:
+                if not chunk.content.lstrip().startswith(_PROGRESS_PREFIXES):
+                    result += chunk.content
+
+        return QueryResponse(answer=_extract_answer(result))
 
 
 @app.post("/stream")
 async def stream(req: QueryRequest) -> StreamingResponse:
     """
-    Streaming query example.
-    Invoke example:
-
-    ```shell
-    curl -N -X POST "http://localhost:8000/stream" \
-    -H "Content-Type: application/json" \
-    -d '{"question": "What is the weather in Beijing today?"}'
-
-    ```
-
-    Response example:
-
-    ```text
-
-    data: {"answer": "Beijing has "}
-
-    data: {"answer": "sunny weather"}
-
-    data: {"answer": " today, with"}
-
-    data: {"answer": " temperatures"}
-
-    data: {"answer": " between 10°C and 20°C."}
-
-
-    ```
-
+    Streaming SSE endpoint (always returns SSE regardless of Accept header).
     """
-
-    async def stream_response():
-        async for chunk in agent_loop(req.to_messages(), MAIN_AGENT_TOOLS):
-            if chunk.type == "text" and chunk.content:
-                data = {
-                    "answer": chunk.content,
-                }
-                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-            elif chunk.type == "text" and chunk.content == "":
-                # Send actual SSE data event (not comment) to keep connection alive.
-                yield 'data: {"answer": ""}\n\n'
-
     return StreamingResponse(
-        stream_response(),
+        stream_with_heartbeat(_query_message_chunks(req)),
         media_type="text/event-stream",
     )
 
