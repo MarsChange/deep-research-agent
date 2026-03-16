@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">🔍 Deep Research Agent</h1>
+  <h1 align="center">🔍 Search Pilot - A Deep Research Agent</h1>
   <p align="center"><b>基于多智能体协作的深度研究系统，专攻复杂多跳推理问答</b></p>
   <em><p align="center">本项目为<a href=https://tianchi.aliyun.com/competition/entrance/532448/customize823>阿里云 Data+AI 工程师全球大奖赛：高校赛道</a>的 <b>Research Agent</b> 参赛项目</p></em>
 </p>
@@ -149,17 +149,17 @@ python -m uvicorn agent:app --reload --host 0.0.0.0 --port 8000
 
 将 `.env.template` 复制为 `.env` 并填入相应的 API Keys。工具模块按需加载——只有配置了对应 Key 的工具才会被激活。
 
-| 环境变量 | 必需 | 说明 |
-|---------|------|------|
-| `DASHSCOPE_API_KEY` | ✅ | 阿里云 DashScope API Key，用于调用 Qwen 大模型 |
-| `QWEN_MODEL` | | 模型名称，默认 `qwen-max` |
-| `SERPER_API_KEYS` | | Google 搜索服务 Key 池（可选，支持逗号/换行分隔多个 key） |
-| `SERPER_API_KEY` | | Google 搜索服务 (Serper)，启用搜索引擎工具 |
-| `JINA_API_KEY` | | Jina AI，启用网页爬取、网页分析、Wikipedia 降级 |
-| `E2B_API_KEY` | | E2B 沙箱，启用安全的 Python 代码执行 |
-| `PLAYWRIGHT_MCP_URL` | | Playwright MCP 服务 URL，启用浏览器自动化 |
-| `PLAYWRIGHT_MCP_TOKEN` | | Playwright MCP 认证令牌 |
-| `SUB_AGENT_NUM` | | 并行子智能体数量，默认 `3` |
+| 环境变量                 | 必需 | 说明                                                      |
+| ------------------------ | ---- | --------------------------------------------------------- |
+| `DASHSCOPE_API_KEY`    | ✅   | 阿里云 DashScope API Key，用于调用 Qwen 大模型            |
+| `QWEN_MODEL`           |      | 模型名称，默认 `qwen-max`                               |
+| `SERPER_API_KEYS`      |      | Google 搜索服务 Key 池（可选，支持逗号/换行分隔多个 key） |
+| `SERPER_API_KEY`       |      | Google 搜索服务 (Serper)，启用搜索引擎工具                |
+| `JINA_API_KEY`         |      | Jina AI，启用网页爬取、网页分析、Wikipedia 降级           |
+| `E2B_API_KEY`          |      | E2B 沙箱，启用安全的 Python 代码执行                      |
+| `PLAYWRIGHT_MCP_URL`   |      | Playwright MCP 服务 URL，启用浏览器自动化                 |
+| `PLAYWRIGHT_MCP_TOKEN` |      | Playwright MCP 认证令牌                                   |
+| `SUB_AGENT_NUM`        |      | 并行子智能体数量，默认 `3`                              |
 
 ### 最小配置
 
@@ -178,17 +178,17 @@ JINA_API_KEY=jina_xxxxx
 
 ### 工具分配
 
-| 工具 | 主智能体 | 子智能体 | 说明 |
-|------|---------|---------|------|
-| `execute_subtasks` | ✅ | — | 向子智能体派发研究子任务（运行时注入） |
-| `code_sandbox` | ✅ | — | E2B Python 沙箱执行 |
-| `search_engine` | — | ✅ | Google 搜索 (Serper API) |
-| `search_wikipedia` | — | ✅ | Wikipedia 当前内容查询 |
-| `search_wikipedia_revision` | — | ✅ | Wikipedia 历史版本内容 |
-| `list_wikipedia_revisions` | — | ✅ | Wikipedia 修订历史列表 |
-| `scrape_website` | — | ✅ | 网页爬取 (Jina Reader) |
-| `analyze_webpage` | — | ✅ | LLM 驱动的网页智能分析 |
-| `browser_*` | — | ✅ | 浏览器自动化 (Playwright MCP) |
+| 工具                          | 主智能体 | 子智能体 | 说明                                   |
+| ----------------------------- | -------- | -------- | -------------------------------------- |
+| `execute_subtasks`          | ✅       | —       | 向子智能体派发研究子任务（运行时注入） |
+| `code_sandbox`              | ✅       | —       | E2B Python 沙箱执行                    |
+| `search_engine`             | —       | ✅       | Google 搜索 (Serper API)               |
+| `search_wikipedia`          | —       | ✅       | Wikipedia 当前内容查询                 |
+| `search_wikipedia_revision` | —       | ✅       | Wikipedia 历史版本内容                 |
+| `list_wikipedia_revisions`  | —       | ✅       | Wikipedia 修订历史列表                 |
+| `scrape_website`            | —       | ✅       | 网页爬取 (Jina Reader)                 |
+| `analyze_webpage`           | —       | ✅       | LLM 驱动的网页智能分析                 |
+| `browser_*`                 | —       | ✅       | 浏览器自动化 (Playwright MCP)          |
 
 ### 工具详情
 
@@ -255,14 +255,23 @@ Agent 的核心推理策略遵循 **链式解题 (Chain Resolution)** 模式：
 
 系统在多个层面实现了容错机制，确保在网络受限或内容审核场景下仍能稳定运行：
 
-| 层面 | 机制 | 说明 |
-|------|------|------|
-| Wikipedia 访问 | API 超时(2s) → Jina Reader 降级 | 应对国内网络无法直连 Wikipedia 的场景 |
-| 网页爬取 | Jina Reader → requests + MarkItDown | CAPTCHA/反爬自动检测并切换策略 |
-| 内容过滤 | `data_inspection_failed` 自动清洗重试 | Wikipedia 等外部内容触发 DashScope 内容审核时，自动替换敏感内容并继续推理 |
-| 工具执行 | 30s 超时保护 | 单个工具调用超时后返回错误信息，不阻塞整体流程 |
-| 子智能体异常 | `asyncio.gather` + `return_exceptions` | 单个子智能体失败不影响其他并行子智能体的正常返回 |
-| 主智能体兜底 | 最大轮次耗尽 → 强制总结生成答案 | 即使未完全解答也会基于已有信息给出最佳猜测 |
+| 层面           | 机制                                       | 说明                                                                      |
+| -------------- | ------------------------------------------ | ------------------------------------------------------------------------- |
+| Wikipedia 访问 | API 超时(2s) → Jina Reader 降级           | 应对国内网络无法直连 Wikipedia 的场景                                     |
+| 网页爬取       | Jina Reader → requests + MarkItDown       | CAPTCHA/反爬自动检测并切换策略                                            |
+| 内容过滤       | `data_inspection_failed` 自动清洗重试    | Wikipedia 等外部内容触发 DashScope 内容审核时，自动替换敏感内容并继续推理 |
+| 工具执行       | 30s 超时保护                               | 单个工具调用超时后返回错误信息，不阻塞整体流程                            |
+| 子智能体异常   | `asyncio.gather` + `return_exceptions` | 单个子智能体失败不影响其他并行子智能体的正常返回                          |
+| 主智能体兜底   | 最大轮次耗尽 → 强制总结生成答案           | 即使未完全解答也会基于已有信息给出最佳猜测                                |
+
+## 比赛成绩（初赛27/188，复赛15/49）
+### 初赛
+
+![初赛成绩截图](docs/preliminary-result.png)
+
+### 复赛
+
+![复赛成绩截图](docs/final-result.png)
 
 ## License
 
