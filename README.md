@@ -268,10 +268,12 @@ Agent 的核心推理策略遵循 **链式解题 (Chain Resolution)** 模式：
 ### 初赛
 
 ![初赛成绩截图](docs/preliminary-result.png)
-
 ### 复赛
 
 ![复赛成绩截图](docs/final-result.png)
+
+初次参赛，尚有许多不足，欢迎大家提 Issue 一起交流、讨论方案和改进思路。
+
 
 ## License
 
