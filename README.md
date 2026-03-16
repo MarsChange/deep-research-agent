@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">🔍 Search Pilot - A Deep Research Agent</h1>
   <p align="center"><b>基于多智能体协作的深度研究系统，专攻复杂多跳推理问答</b></p>
-  <em><p align="center">本项目为<a href=https://tianchi.aliyun.com/competition/entrance/532448/customize823>阿里云 Data+AI 工程师全球大奖赛：高校赛道</a>的 <b>Research Agent</b> 参赛项目</p></em>
+  <em><p align="center">本项目为<a href=https://tianchi.aliyun.com/competition/entrance/532448/customize823>阿里云 Data+AI 工程师全球大奖赛：高校赛道</a>的 <b>Research Agent</b> 参赛项目 (Rank 15)</p></em>
 </p>
 
 <p align="center">
